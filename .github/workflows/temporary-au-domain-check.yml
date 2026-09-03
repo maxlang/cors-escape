@@ -1,4 +1,4 @@
-name: Temporary two-letter .au registrar check
+name: Temporary .au registrar UI validation
 
 on:
   push:
@@ -9,120 +9,77 @@ permissions:
   contents: read
 
 jobs:
-  check:
+  validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 8
     steps:
-      - name: Fetch audited bulk checker
+      - name: Install browser driver
         shell: bash
         run: |
           set -euo pipefail
-          git clone --depth 1 https://github.com/davejoelwilson/domain-checker.git checker
+          python -m pip install --quiet playwright
 
-      - name: Check all 676 letter-only direct .au names
+      - name: Submit a small control batch through the registrar's public bulk-search form
         shell: python
         run: |
-          import hashlib
-          import importlib.util
           import json
-          import string
-          import sys
-          from datetime import datetime, timezone
-          from pathlib import Path
+          import os
+          import re
+          from playwright.sync_api import sync_playwright
 
-          module_path = Path("checker/domcheck.py")
-          spec = importlib.util.spec_from_file_location("domcheck", module_path)
-          module = importlib.util.module_from_spec(spec)
-          assert spec.loader is not None
-          spec.loader.exec_module(module)
+          controls = [
+              "ao.au",
+              "aa.au",
+              "lq.au",
+              "vq.au",
+              "xqzvkjhgfdsapoiuytrewq.au",
+          ]
 
-          requested = [f"{a}{b}.au" for a in string.ascii_lowercase for b in string.ascii_lowercase]
-          assert len(requested) == 676 and len(set(requested)) == 676
+          with sync_playwright() as p:
+              executable = "/usr/bin/google-chrome"
+              browser = p.chromium.launch(
+                  executable_path=executable if os.path.exists(executable) else None,
+                  headless=True,
+                  args=["--no-sandbox"],
+              )
+              page = browser.new_page(viewport={"width": 1440, "height": 1200})
+              page.goto("https://www.ddns.com.au/domains/bulkregister", wait_until="networkidle", timeout=90000)
 
-          results = module.check_domains_batched(requested, batch_size=20, delay=0.75)
-          by_name = {}
-          duplicates = []
-          malformed = []
-          for result in results:
-              name = str(result.get("name", "")).lower().rstrip(".")
-              if not name:
-                  malformed.append(result)
-                  continue
-              if name in by_name:
-                  duplicates.append(name)
-              by_name[name] = result
+              candidates = page.locator("textarea:visible")
+              if candidates.count() == 0:
+                  candidates = page.locator("input[type=text]:visible")
+              if candidates.count() == 0:
+                  raise RuntimeError("No visible bulk-search input found")
 
-          missing = sorted(set(requested) - set(by_name))
-          extra = sorted(set(by_name) - set(requested))
-          errors = sorted(
-              name for name, result in by_name.items()
-              if result.get("error")
-          )
-          available = sorted(
-              name for name, result in by_name.items()
-              if result.get("available") is True and not result.get("error")
-          )
-          unavailable = sorted(
-              name for name, result in by_name.items()
-              if result.get("available") is False and not result.get("error")
-          )
-          ambiguous = sorted(
-              name for name, result in by_name.items()
-              if result.get("available") not in (True, False) and not result.get("error")
-          )
+              field = candidates.first
+              field.fill("\n".join(controls))
 
-          raw_path = Path("two-letter-au-namecheap-raw.json")
-          raw_path.write_text(
-              json.dumps(results, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-              encoding="utf-8",
-          )
-          summary = {
-              "checked_at_utc": datetime.now(timezone.utc).isoformat(),
-              "method": "Namecheap bulk availability backend via davejoelwilson/domain-checker",
-              "checker_commit": "$(git -C checker rev-parse HEAD)",
-              "requested_count": len(requested),
-              "returned_count": len(results),
-              "unique_returned_count": len(by_name),
-              "available_count": len(available),
-              "unavailable_count": len(unavailable),
-              "error_count": len(errors),
-              "ambiguous_count": len(ambiguous),
-              "available": available,
-              "errors": errors,
-              "ambiguous": ambiguous,
-              "missing": missing,
-              "extra": extra,
-              "duplicates": sorted(set(duplicates)),
-              "malformed_count": len(malformed),
-              "raw_sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
-          }
-          # Replace the literal shell placeholder with the actual commit, without shell interpolation risks.
-          import subprocess
-          summary["checker_commit"] = subprocess.run(
-              ["git", "-C", "checker", "rev-parse", "HEAD"],
-              check=True,
-              capture_output=True,
-              text=True,
-          ).stdout.strip()
+              buttons = page.get_by_role("button", name=re.compile(r"^Search$", re.I))
+              if buttons.count() == 0:
+                  buttons = page.locator("input[type=submit][value*='Search' i]:visible")
+              if buttons.count() == 0:
+                  raise RuntimeError("No visible Search button found")
 
-          Path("two-letter-au-summary.json").write_text(
-              json.dumps(summary, indent=2, sort_keys=True) + "\n",
-              encoding="utf-8",
-          )
-          print("BEGIN_TWO_LETTER_AU_SUMMARY")
-          print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
-          print("END_TWO_LETTER_AU_SUMMARY")
+              buttons.first.click()
+              page.wait_for_timeout(8000)
+              page.wait_for_load_state("networkidle", timeout=90000)
+              body = page.locator("body").inner_text()
 
-          if missing or extra or duplicates or malformed or errors or ambiguous:
-              raise SystemExit("Registrar response did not fully and unambiguously cover all 676 names")
+              print("BEGIN_CONTROL_RESULT")
+              print(json.dumps({
+                  "url": page.url,
+                  "controls": controls,
+                  "body_text": body,
+              }, ensure_ascii=False))
+              print("END_CONTROL_RESULT")
+              page.screenshot(path="ddns-control-result.png", full_page=True)
+              browser.close()
 
-      - name: Upload exact results
+      - name: Upload control screenshot
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: two-letter-au-results
-          path: |
-            two-letter-au-summary.json
-            two-letter-au-namecheap-raw.json
+          name: ddns-control-result
+          path: ddns-control-result.png
           if-no-files-found: warn
           retention-days: 1
