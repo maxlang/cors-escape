@@ -1,0 +1,93 @@
+name: Temporary two-letter .au availability check
+
+on:
+  push:
+    branches:
+      - chatgpt-au-domain-check-20260903
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check all 676 letter-only direct .au domains
+        shell: python
+        run: |
+          import hashlib
+          import json
+          import string
+          import time
+          import urllib.error
+          import urllib.request
+          from datetime import datetime, timezone
+
+          endpoint = "https://domainnameregistration.com/availability/bulk-check"
+          requested = [f"{a}{b}.au" for a in string.ascii_lowercase for b in string.ascii_lowercase]
+          assert len(requested) == 676
+          body = json.dumps({"domains": requested}, separators=(",", ":")).encode("utf-8")
+
+          last_error = None
+          for attempt in range(3):
+              request = urllib.request.Request(
+                  endpoint,
+                  data=body,
+                  method="POST",
+                  headers={
+                      "Accept": "application/json",
+                      "Content-Type": "application/json",
+                      "User-Agent": "chatgpt-two-letter-au-availability-check/1.0",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=60) as response:
+                      raw = response.read()
+                      http_status = response.status
+                  break
+              except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
+                  last_error = repr(exc)
+                  if attempt == 2:
+                      raise
+                  time.sleep(2 ** attempt)
+          else:
+              raise RuntimeError(last_error)
+
+          payload = json.loads(raw)
+          returned_domains = payload.get("domains")
+          returned_statuses = payload.get("statuses", payload.get("status"))
+          if not isinstance(returned_domains, list) or not isinstance(returned_statuses, list):
+              raise ValueError(f"Unexpected response keys: {sorted(payload) if isinstance(payload, dict) else type(payload).__name__}")
+          if len(returned_domains) != len(returned_statuses):
+              raise ValueError("Response domain/status arrays are misaligned")
+          if len(returned_domains) != 676:
+              raise ValueError(f"Expected 676 responses, got {len(returned_domains)}")
+          if len(set(returned_domains)) != 676 or set(returned_domains) != set(requested):
+              missing = sorted(set(requested) - set(returned_domains))
+              extra = sorted(set(returned_domains) - set(requested))
+              raise ValueError(f"Response domain set mismatch; missing={missing}; extra={extra}")
+
+          groups = {"available": [], "taken": [], "no_info": [], "aftermarket": []}
+          labels = {0: "available", 1: "taken", 2: "no_info", 3: "aftermarket"}
+          for domain, status in zip(returned_domains, returned_statuses):
+              if status not in labels:
+                  raise ValueError(f"Unknown status {status!r} for {domain}")
+              groups[labels[status]].append(domain)
+          for names in groups.values():
+              names.sort()
+
+          summary = {
+              "checked_at_utc": datetime.now(timezone.utc).isoformat(),
+              "endpoint": endpoint,
+              "http_status": http_status,
+              "checked": len(requested),
+              "counts": {name: len(domains) for name, domains in groups.items()},
+              "available": groups["available"],
+              "no_info": groups["no_info"],
+              "aftermarket": groups["aftermarket"],
+              "response_sha256": hashlib.sha256(raw).hexdigest(),
+          }
+          print("BEGIN_AU_RESULT")
+          print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
+          print("END_AU_RESULT")
