@@ -1,4 +1,4 @@
-name: Temporary .au registrar UI validation
+name: Temporary .au registrar submission trace
 
 on:
   push:
@@ -9,17 +9,15 @@ permissions:
   contents: read
 
 jobs:
-  validate:
+  trace:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
       - name: Install browser driver
         shell: bash
-        run: |
-          set -euo pipefail
-          python -m pip install --quiet playwright
+        run: python -m pip install --quiet playwright
 
-      - name: Submit a small control batch through the registrar's public bulk-search form
+      - name: Trace a normal supported bulk-search submission
         shell: python
         run: |
           import json
@@ -27,13 +25,8 @@ jobs:
           import re
           from playwright.sync_api import sync_playwright
 
-          controls = [
-              "ao.au",
-              "aa.au",
-              "lq.au",
-              "vq.au",
-              "xqzvkjhgfdsapoiuytrewq.au",
-          ]
+          controls = ["auda.au", "xqzvkjhgfdsapoiuytrewq.au"]
+          events = []
 
           with sync_playwright() as p:
               executable = "/usr/bin/google-chrome"
@@ -45,41 +38,50 @@ jobs:
               page = browser.new_page(viewport={"width": 1440, "height": 1200})
               page.goto("https://www.ddns.com.au/domains/bulkregister", wait_until="networkidle", timeout=90000)
 
-              candidates = page.locator("textarea:visible")
-              if candidates.count() == 0:
-                  candidates = page.locator("input[type=text]:visible")
-              if candidates.count() == 0:
-                  raise RuntimeError("No visible bulk-search input found")
+              def on_request(request):
+                  if request.resource_type in {"xhr", "fetch", "document"}:
+                      events.append({
+                          "kind": "request",
+                          "resource_type": request.resource_type,
+                          "method": request.method,
+                          "url": request.url,
+                          "post_data": request.post_data,
+                      })
 
-              field = candidates.first
+              def on_response(response):
+                  request = response.request
+                  if request.resource_type in {"xhr", "fetch", "document"}:
+                      item = {
+                          "kind": "response",
+                          "resource_type": request.resource_type,
+                          "method": request.method,
+                          "url": response.url,
+                          "status": response.status,
+                          "content_type": response.headers.get("content-type", ""),
+                      }
+                      try:
+                          if "json" in item["content_type"] or request.resource_type in {"xhr", "fetch"}:
+                              item["body"] = response.text()[:20000]
+                      except Exception as exc:
+                          item["body_error"] = repr(exc)
+                      events.append(item)
+
+              page.on("request", on_request)
+              page.on("response", on_response)
+
+              field = page.locator("textarea:visible").first
               field.fill("\n".join(controls))
-
-              buttons = page.get_by_role("button", name=re.compile(r"^Search$", re.I))
-              if buttons.count() == 0:
-                  buttons = page.locator("input[type=submit][value*='Search' i]:visible")
-              if buttons.count() == 0:
-                  raise RuntimeError("No visible Search button found")
-
-              buttons.first.click()
-              page.wait_for_timeout(8000)
+              page.get_by_role("button", name=re.compile(r"^Search$", re.I)).first.click()
+              page.wait_for_timeout(10000)
               page.wait_for_load_state("networkidle", timeout=90000)
               body = page.locator("body").inner_text()
 
-              print("BEGIN_CONTROL_RESULT")
+              print("BEGIN_TRACE_RESULT")
               print(json.dumps({
-                  "url": page.url,
                   "controls": controls,
+                  "events": events,
                   "body_text": body,
+                  "url": page.url,
               }, ensure_ascii=False))
-              print("END_CONTROL_RESULT")
-              page.screenshot(path="ddns-control-result.png", full_page=True)
+              print("END_TRACE_RESULT")
               browser.close()
-
-      - name: Upload control screenshot
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: ddns-control-result
-          path: ddns-control-result.png
-          if-no-files-found: warn
-          retention-days: 1
