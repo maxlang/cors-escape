@@ -11,83 +11,118 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
-      - name: Check all 676 letter-only direct .au domains
+      - name: Ensure DNS query tool is present
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v dig >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq bind9-dnsutils
+          fi
+          dig -v
+
+      - name: Query the authoritative .au nameservers for all 676 names
         shell: python
         run: |
+          import concurrent.futures
           import hashlib
           import json
+          import re
           import string
-          import time
-          import urllib.error
-          import urllib.request
+          import subprocess
           from datetime import datetime, timezone
 
-          endpoint = "https://domainnameregistration.com/availability/bulk-check"
-          requested = [f"{a}{b}.au" for a in string.ascii_lowercase for b in string.ascii_lowercase]
-          assert len(requested) == 676
-          body = json.dumps({"domains": requested}, separators=(",", ":")).encode("utf-8")
+          domains = [f"{a}{b}.au" for a in string.ascii_lowercase for b in string.ascii_lowercase]
+          assert len(domains) == 676 and len(set(domains)) == 676
 
-          last_error = None
-          for attempt in range(3):
-              request = urllib.request.Request(
-                  endpoint,
-                  data=body,
-                  method="POST",
-                  headers={
-                      "Accept": "application/json",
-                      "Content-Type": "application/json",
-                      "User-Agent": "chatgpt-two-letter-au-availability-check/1.0",
-                  },
+          ns_lookup = subprocess.run(
+              ["dig", "+short", "NS", "au."],
+              check=True,
+              capture_output=True,
+              text=True,
+              timeout=30,
+          )
+          nameservers = sorted({line.strip().rstrip(".") for line in ns_lookup.stdout.splitlines() if line.strip()})
+          if not nameservers:
+              raise RuntimeError("Could not discover the authoritative .au nameservers")
+
+          status_re = re.compile(r"status:\s*([A-Z]+)")
+
+          def one_query(domain, nameserver):
+              completed = subprocess.run(
+                  [
+                      "dig",
+                      f"@{nameserver}",
+                      domain + ".",
+                      "NS",
+                      "+norecurse",
+                      "+time=4",
+                      "+tries=2",
+                      "+noall",
+                      "+comments",
+                      "+answer",
+                  ],
+                  capture_output=True,
+                  text=True,
+                  timeout=12,
               )
-              try:
-                  with urllib.request.urlopen(request, timeout=60) as response:
-                      raw = response.read()
-                      http_status = response.status
-                  break
-              except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:
-                  last_error = repr(exc)
-                  if attempt == 2:
-                      raise
-                  time.sleep(2 ** attempt)
-          else:
-              raise RuntimeError(last_error)
+              text = completed.stdout + "\n" + completed.stderr
+              match = status_re.search(text)
+              status = match.group(1) if match else "NO_STATUS"
+              ns_answers = [
+                  line.strip()
+                  for line in completed.stdout.splitlines()
+                  if line.strip() and not line.startswith(";") and re.search(r"\sNS\s", line)
+              ]
+              return status, ns_answers, text[-1000:]
 
-          payload = json.loads(raw)
-          returned_domains = payload.get("domains")
-          returned_statuses = payload.get("statuses", payload.get("status"))
-          if not isinstance(returned_domains, list) or not isinstance(returned_statuses, list):
-              raise ValueError(f"Unexpected response keys: {sorted(payload) if isinstance(payload, dict) else type(payload).__name__}")
-          if len(returned_domains) != len(returned_statuses):
-              raise ValueError("Response domain/status arrays are misaligned")
-          if len(returned_domains) != 676:
-              raise ValueError(f"Expected 676 responses, got {len(returned_domains)}")
-          if len(set(returned_domains)) != 676 or set(returned_domains) != set(requested):
-              missing = sorted(set(requested) - set(returned_domains))
-              extra = sorted(set(returned_domains) - set(requested))
-              raise ValueError(f"Response domain set mismatch; missing={missing}; extra={extra}")
+          def classify(item):
+              index, domain = item
+              attempts = []
+              # Round-robin across the authoritative fleet, retrying on a second server
+              # only when the first answer is not conclusive.
+              for offset in range(min(2, len(nameservers))):
+                  nameserver = nameservers[(index + offset) % len(nameservers)]
+                  try:
+                      status, answers, raw_tail = one_query(domain, nameserver)
+                  except Exception as exc:
+                      attempts.append({"nameserver": nameserver, "error": repr(exc)})
+                      continue
+                  attempts.append({"nameserver": nameserver, "status": status, "answers": answers})
+                  if status == "NXDOMAIN":
+                      return domain, "dns_absent", attempts
+                  if status == "NOERROR" and answers:
+                      return domain, "delegated", attempts
+                  if status == "NOERROR":
+                      return domain, "no_ns_answer", attempts
+              return domain, "unknown", attempts
 
-          groups = {"available": [], "taken": [], "no_info": [], "aftermarket": []}
-          labels = {0: "available", 1: "taken", 2: "no_info", 3: "aftermarket"}
-          for domain, status in zip(returned_domains, returned_statuses):
-              if status not in labels:
-                  raise ValueError(f"Unknown status {status!r} for {domain}")
-              groups[labels[status]].append(domain)
-          for names in groups.values():
-              names.sort()
+          groups = {"delegated": [], "dns_absent": [], "no_ns_answer": [], "unknown": []}
+          details = {}
+          with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+              for domain, classification, attempts in pool.map(classify, enumerate(domains)):
+                  groups[classification].append(domain)
+                  if classification != "delegated":
+                      details[domain] = attempts
 
+          for values in groups.values():
+              values.sort()
+
+          canonical = json.dumps(groups, sort_keys=True, separators=(",", ":")).encode("utf-8")
           summary = {
               "checked_at_utc": datetime.now(timezone.utc).isoformat(),
-              "endpoint": endpoint,
-              "http_status": http_status,
-              "checked": len(requested),
-              "counts": {name: len(domains) for name, domains in groups.items()},
-              "available": groups["available"],
-              "no_info": groups["no_info"],
-              "aftermarket": groups["aftermarket"],
-              "response_sha256": hashlib.sha256(raw).hexdigest(),
+              "method": "authoritative DNS NS query against the .au parent zone",
+              "checked": len(domains),
+              "authoritative_nameservers": nameservers,
+              "counts": {key: len(value) for key, value in groups.items()},
+              "dns_absent": groups["dns_absent"],
+              "no_ns_answer": groups["no_ns_answer"],
+              "unknown": groups["unknown"],
+              "nondelegated_details": details,
+              "classification_sha256": hashlib.sha256(canonical).hexdigest(),
           }
-          print("BEGIN_AU_RESULT")
+          print("BEGIN_AU_DNS_RESULT")
           print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
-          print("END_AU_RESULT")
+          print("END_AU_DNS_RESULT")
