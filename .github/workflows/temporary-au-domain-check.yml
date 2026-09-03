@@ -1,4 +1,4 @@
-name: Temporary two-letter .au availability check
+name: Temporary .au checker endpoint inspection
 
 on:
   push:
@@ -9,120 +9,69 @@ permissions:
   contents: read
 
 jobs:
-  check:
+  inspect:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 5
     steps:
-      - name: Ensure DNS query tool is present
+      - name: Inspect Stack2 domain-checker frontend and one live request
         shell: bash
         run: |
           set -euo pipefail
-          if ! command -v dig >/dev/null 2>&1; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq bind9-dnsutils
-          fi
-          dig -v
-
-      - name: Query the authoritative .au nameservers for all 676 names
-        shell: python
-        run: |
-          import concurrent.futures
-          import hashlib
+          python - <<'PY'
+          import html
           import json
           import re
-          import string
-          import subprocess
-          from datetime import datetime, timezone
+          import urllib.parse
+          import urllib.request
 
-          domains = [f"{a}{b}.au" for a in string.ascii_lowercase for b in string.ascii_lowercase]
-          assert len(domains) == 676 and len(set(domains)) == 676
+          page_url = "https://stack2.au/tools/domain-checker"
+          req = urllib.request.Request(page_url, headers={"User-Agent": "Mozilla/5.0"})
+          with urllib.request.urlopen(req, timeout=30) as response:
+              page = response.read().decode("utf-8", "replace")
+          print("PAGE_STATUS=200")
+          print("PAGE_BYTES=" + str(len(page)))
 
-          ns_lookup = subprocess.run(
-              ["dig", "+short", "NS", "au."],
-              check=True,
-              capture_output=True,
-              text=True,
-              timeout=30,
-          )
-          nameservers = sorted({line.strip().rstrip(".") for line in ns_lookup.stdout.splitlines() if line.strip()})
-          if not nameservers:
-              raise RuntimeError("Could not discover the authoritative .au nameservers")
+          srcs = []
+          for raw in re.findall(r'<script[^>]+src=["\']([^"\']+)', page, flags=re.I):
+              url = urllib.parse.urljoin(page_url, html.unescape(raw))
+              if url not in srcs:
+                  srcs.append(url)
+          print("SCRIPT_COUNT=" + str(len(srcs)))
+          for src in srcs:
+              print("SCRIPT=" + src)
 
-          status_re = re.compile(r"status:\s*([A-Z]+)")
-
-          def one_query(domain, nameserver):
-              completed = subprocess.run(
-                  [
-                      "dig",
-                      f"@{nameserver}",
-                      domain + ".",
-                      "NS",
-                      "+norecurse",
-                      "+time=4",
-                      "+tries=2",
-                      "+noall",
-                      "+comments",
-                      "+answer",
-                  ],
-                  capture_output=True,
-                  text=True,
-                  timeout=12,
-              )
-              text = completed.stdout + "\n" + completed.stderr
-              match = status_re.search(text)
-              status = match.group(1) if match else "NO_STATUS"
-              ns_answers = [
-                  line.strip()
-                  for line in completed.stdout.splitlines()
-                  if line.strip() and not line.startswith(";") and re.search(r"\sNS\s", line)
-              ]
-              return status, ns_answers, text[-1000:]
-
-          def classify(item):
-              index, domain = item
-              attempts = []
-              # Round-robin across the authoritative fleet, retrying on a second server
-              # only when the first answer is not conclusive.
-              for offset in range(min(2, len(nameservers))):
-                  nameserver = nameservers[(index + offset) % len(nameservers)]
-                  try:
-                      status, answers, raw_tail = one_query(domain, nameserver)
-                  except Exception as exc:
-                      attempts.append({"nameserver": nameserver, "error": repr(exc)})
-                      continue
-                  attempts.append({"nameserver": nameserver, "status": status, "answers": answers})
-                  if status == "NXDOMAIN":
-                      return domain, "dns_absent", attempts
-                  if status == "NOERROR" and answers:
-                      return domain, "delegated", attempts
-                  if status == "NOERROR":
-                      return domain, "no_ns_answer", attempts
-              return domain, "unknown", attempts
-
-          groups = {"delegated": [], "dns_absent": [], "no_ns_answer": [], "unknown": []}
-          details = {}
-          with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
-              for domain, classification, attempts in pool.map(classify, enumerate(domains)):
-                  groups[classification].append(domain)
-                  if classification != "delegated":
-                      details[domain] = attempts
-
-          for values in groups.values():
-              values.sort()
-
-          canonical = json.dumps(groups, sort_keys=True, separators=(",", ":")).encode("utf-8")
-          summary = {
-              "checked_at_utc": datetime.now(timezone.utc).isoformat(),
-              "method": "authoritative DNS NS query against the .au parent zone",
-              "checked": len(domains),
-              "authoritative_nameservers": nameservers,
-              "counts": {key: len(value) for key, value in groups.items()},
-              "dns_absent": groups["dns_absent"],
-              "no_ns_answer": groups["no_ns_answer"],
-              "unknown": groups["unknown"],
-              "nondelegated_details": details,
-              "classification_sha256": hashlib.sha256(canonical).hexdigest(),
-          }
-          print("BEGIN_AU_DNS_RESULT")
-          print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
-          print("END_AU_DNS_RESULT")
+          needles = [
+              "domain-check", "availability", "available", "/api/", "fetch(",
+              "whois", "registry", "check-domain", "domainChecker"
+          ]
+          for src in srcs:
+              try:
+                  req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      text = response.read().decode("utf-8", "replace")
+              except Exception as exc:
+                  print("SCRIPT_ERROR=" + src + " " + repr(exc))
+                  continue
+              low = text.lower()
+              hits = []
+              for needle in needles:
+                  start = 0
+                  nlow = needle.lower()
+                  while True:
+                      idx = low.find(nlow, start)
+                      if idx < 0:
+                          break
+                      snippet = text[max(0, idx-220):min(len(text), idx+420)]
+                      snippet = re.sub(r"\s+", " ", snippet)
+                      hits.append((idx, needle, snippet))
+                      start = idx + len(nlow)
+                      if len(hits) >= 40:
+                          break
+                  if len(hits) >= 40:
+                      break
+              if hits:
+                  print("BEGIN_SCRIPT_HITS " + src)
+                  for idx, needle, snippet in hits:
+                      print(json.dumps({"offset": idx, "needle": needle, "snippet": snippet}, ensure_ascii=False))
+                  print("END_SCRIPT_HITS")
+          PY
