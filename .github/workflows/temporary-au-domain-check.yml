@@ -1,4 +1,4 @@
-name: Temporary .au checker endpoint inspection
+name: Temporary two-letter .au registrar check
 
 on:
   push:
@@ -9,69 +9,120 @@ permissions:
   contents: read
 
 jobs:
-  inspect:
+  check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
-      - name: Inspect Stack2 domain-checker frontend and one live request
+      - name: Fetch audited bulk checker
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY'
-          import html
+          git clone --depth 1 https://github.com/davejoelwilson/domain-checker.git checker
+
+      - name: Check all 676 letter-only direct .au names
+        shell: python
+        run: |
+          import hashlib
+          import importlib.util
           import json
-          import re
-          import urllib.parse
-          import urllib.request
+          import string
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
 
-          page_url = "https://stack2.au/tools/domain-checker"
-          req = urllib.request.Request(page_url, headers={"User-Agent": "Mozilla/5.0"})
-          with urllib.request.urlopen(req, timeout=30) as response:
-              page = response.read().decode("utf-8", "replace")
-          print("PAGE_STATUS=200")
-          print("PAGE_BYTES=" + str(len(page)))
+          module_path = Path("checker/domcheck.py")
+          spec = importlib.util.spec_from_file_location("domcheck", module_path)
+          module = importlib.util.module_from_spec(spec)
+          assert spec.loader is not None
+          spec.loader.exec_module(module)
 
-          srcs = []
-          for raw in re.findall(r'<script[^>]+src=["\']([^"\']+)', page, flags=re.I):
-              url = urllib.parse.urljoin(page_url, html.unescape(raw))
-              if url not in srcs:
-                  srcs.append(url)
-          print("SCRIPT_COUNT=" + str(len(srcs)))
-          for src in srcs:
-              print("SCRIPT=" + src)
+          requested = [f"{a}{b}.au" for a in string.ascii_lowercase for b in string.ascii_lowercase]
+          assert len(requested) == 676 and len(set(requested)) == 676
 
-          needles = [
-              "domain-check", "availability", "available", "/api/", "fetch(",
-              "whois", "registry", "check-domain", "domainChecker"
-          ]
-          for src in srcs:
-              try:
-                  req = urllib.request.Request(src, headers={"User-Agent": "Mozilla/5.0"})
-                  with urllib.request.urlopen(req, timeout=30) as response:
-                      text = response.read().decode("utf-8", "replace")
-              except Exception as exc:
-                  print("SCRIPT_ERROR=" + src + " " + repr(exc))
+          results = module.check_domains_batched(requested, batch_size=20, delay=0.75)
+          by_name = {}
+          duplicates = []
+          malformed = []
+          for result in results:
+              name = str(result.get("name", "")).lower().rstrip(".")
+              if not name:
+                  malformed.append(result)
                   continue
-              low = text.lower()
-              hits = []
-              for needle in needles:
-                  start = 0
-                  nlow = needle.lower()
-                  while True:
-                      idx = low.find(nlow, start)
-                      if idx < 0:
-                          break
-                      snippet = text[max(0, idx-220):min(len(text), idx+420)]
-                      snippet = re.sub(r"\s+", " ", snippet)
-                      hits.append((idx, needle, snippet))
-                      start = idx + len(nlow)
-                      if len(hits) >= 40:
-                          break
-                  if len(hits) >= 40:
-                      break
-              if hits:
-                  print("BEGIN_SCRIPT_HITS " + src)
-                  for idx, needle, snippet in hits:
-                      print(json.dumps({"offset": idx, "needle": needle, "snippet": snippet}, ensure_ascii=False))
-                  print("END_SCRIPT_HITS")
-          PY
+              if name in by_name:
+                  duplicates.append(name)
+              by_name[name] = result
+
+          missing = sorted(set(requested) - set(by_name))
+          extra = sorted(set(by_name) - set(requested))
+          errors = sorted(
+              name for name, result in by_name.items()
+              if result.get("error")
+          )
+          available = sorted(
+              name for name, result in by_name.items()
+              if result.get("available") is True and not result.get("error")
+          )
+          unavailable = sorted(
+              name for name, result in by_name.items()
+              if result.get("available") is False and not result.get("error")
+          )
+          ambiguous = sorted(
+              name for name, result in by_name.items()
+              if result.get("available") not in (True, False) and not result.get("error")
+          )
+
+          raw_path = Path("two-letter-au-namecheap-raw.json")
+          raw_path.write_text(
+              json.dumps(results, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+              encoding="utf-8",
+          )
+          summary = {
+              "checked_at_utc": datetime.now(timezone.utc).isoformat(),
+              "method": "Namecheap bulk availability backend via davejoelwilson/domain-checker",
+              "checker_commit": "$(git -C checker rev-parse HEAD)",
+              "requested_count": len(requested),
+              "returned_count": len(results),
+              "unique_returned_count": len(by_name),
+              "available_count": len(available),
+              "unavailable_count": len(unavailable),
+              "error_count": len(errors),
+              "ambiguous_count": len(ambiguous),
+              "available": available,
+              "errors": errors,
+              "ambiguous": ambiguous,
+              "missing": missing,
+              "extra": extra,
+              "duplicates": sorted(set(duplicates)),
+              "malformed_count": len(malformed),
+              "raw_sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
+          }
+          # Replace the literal shell placeholder with the actual commit, without shell interpolation risks.
+          import subprocess
+          summary["checker_commit"] = subprocess.run(
+              ["git", "-C", "checker", "rev-parse", "HEAD"],
+              check=True,
+              capture_output=True,
+              text=True,
+          ).stdout.strip()
+
+          Path("two-letter-au-summary.json").write_text(
+              json.dumps(summary, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          print("BEGIN_TWO_LETTER_AU_SUMMARY")
+          print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
+          print("END_TWO_LETTER_AU_SUMMARY")
+
+          if missing or extra or duplicates or malformed or errors or ambiguous:
+              raise SystemExit("Registrar response did not fully and unambiguously cover all 676 names")
+
+      - name: Upload exact results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: two-letter-au-results
+          path: |
+            two-letter-au-summary.json
+            two-letter-au-namecheap-raw.json
+          if-no-files-found: warn
+          retention-days: 1
