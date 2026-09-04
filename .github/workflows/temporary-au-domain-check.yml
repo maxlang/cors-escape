@@ -1,4 +1,4 @@
-name: Temporary numeric two-character .au definitive cross-check
+name: Temporary numeric two-character .au registrar verification
 
 on:
   push:
@@ -11,223 +11,170 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 10
     steps:
-      - name: Install Playwright Python package
-        run: python -m pip install --quiet playwright
+      - name: Fetch the bulk registrar-check client
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/davejoelwilson/domain-checker.git checker
 
-      - name: Check controls and all 38 first-pass candidates
+      - name: Check all 620 two-character names containing a digit
         shell: python
         run: |
           import csv
           import hashlib
+          import importlib.util
           import json
-          import os
-          import re
-          import time
+          import string
+          import subprocess
           from datetime import datetime, timezone
           from pathlib import Path
 
-          from playwright.sync_api import sync_playwright
+          module_path = Path("checker/domcheck.py")
+          spec = importlib.util.spec_from_file_location("domcheck", module_path)
+          module = importlib.util.module_from_spec(spec)
+          assert spec.loader is not None
+          spec.loader.exec_module(module)
 
-          checker_url = "https://stack2.au/tools/domain-checker"
-          candidates = """
-          09.au 0u.au 0x.au 16.au 1b.au 1j.au 1n.au 1p.au 1u.au 20.au
-          24.au 2a.au 2f.au 2t.au 2u.au 36.au 3q.au 42.au 4d.au 4z.au
-          54.au 5z.au 6d.au 6r.au 74.au 75.au 76.au 7l.au 8c.au 8t.au
-          92.au 9c.au 9m.au a4.au d5.au q1.au w5.au x0.au
-          """.split()
-          assert len(candidates) == 38 and len(set(candidates)) == 38
-
-          controls = [
-              ("auda.au", False),
-              ("xqzvkjhgfdsapoiuytrewq.au", True),
+          alphabet = string.ascii_lowercase + string.digits
+          domains = [
+              f"{a}{b}.au"
+              for a in alphabet
+              for b in alphabet
+              if a.isdigit() or b.isdigit()
           ]
+          assert len(domains) == 620 and len(set(domains)) == 620
 
-          def check_one(browser, domain):
-              last_error = None
-              for attempt in range(3):
-                  page = browser.new_page(viewport={"width": 1280, "height": 900})
-                  captured = []
+          controls = ["auda.au", "xqzvkjhgfdsapoiuytrewq.au"]
+          requested = controls + domains
+          results = module.check_domains_batched(
+              requested,
+              batch_size=20,
+              delay=0.8,
+          )
 
-                  def on_response(response):
-                      request = response.request
-                      if request.method != "POST":
-                          return
-                      if response.url.rstrip("/") != checker_url.rstrip("/"):
-                          return
-                      try:
-                          text = response.text()
-                          payload = json.loads(text)
-                          reported = str(payload.get("domain", "")).lower().rstrip(".")
-                          if reported == domain:
-                              captured.append({
-                                  "http_status": response.status,
-                                  "content_type": response.headers.get("content-type", ""),
-                                  "payload": payload,
-                              })
-                      except Exception as exc:
-                          captured.append({"capture_error": repr(exc)})
+          by_name = {}
+          duplicates = []
+          malformed = []
+          for result in results:
+              name = str(result.get("name", "")).lower().rstrip(".")
+              if not name:
+                  malformed.append(result)
+                  continue
+              if name in by_name:
+                  duplicates.append(name)
+              by_name[name] = result
 
-                  try:
-                      page.on("response", on_response)
-                      page.goto(checker_url, wait_until="networkidle", timeout=90000)
+          missing = sorted(set(requested) - set(by_name))
+          extra = sorted(set(by_name) - set(requested))
+          errors = sorted(
+              name for name, result in by_name.items()
+              if result.get("error")
+          )
+          ambiguous = sorted(
+              name for name, result in by_name.items()
+              if not result.get("error") and result.get("available") not in (True, False)
+          )
 
-                      fields = page.locator("input:visible")
-                      field = None
-                      for index in range(fields.count()):
-                          candidate = fields.nth(index)
-                          field_type = (candidate.get_attribute("type") or "text").lower()
-                          if field_type in {"text", "search"}:
-                              field = candidate
-                              break
-                      if field is None:
-                          raise RuntimeError("No visible text/search input found")
-
-                      buttons = page.get_by_role("button", name=re.compile(r"^Check$", re.I))
-                      if buttons.count() == 0:
-                          buttons = page.locator("button:visible")
-                      if buttons.count() == 0:
-                          raise RuntimeError("No visible Check button found")
-
-                      field.fill(domain)
-                      buttons.first.click()
-
-                      for _ in range(100):
-                          page.wait_for_timeout(200)
-                          if captured:
-                              break
-                      if not captured:
-                          raise TimeoutError("No matching checker response within 20 seconds")
-                      if captured[-1].get("capture_error"):
-                          raise RuntimeError(captured[-1]["capture_error"])
-
-                      response_record = captured[-1]
-                      payload = response_record["payload"]
-                      if response_record["http_status"] != 200:
-                          raise RuntimeError(
-                              f"HTTP {response_record['http_status']}: {payload!r}"
-                          )
-                      if payload.get("hasError") is True:
-                          raise RuntimeError(payload.get("errorMessage") or "checker error")
-                      available = payload.get("isAvailable")
-                      if available not in (True, False):
-                          raise ValueError(f"missing boolean isAvailable: {payload!r}")
-
-                      return {
-                          "domain": domain,
-                          "available": bool(available),
-                          "has_error": False,
-                          "error_message": "",
-                          "http_status": response_record["http_status"],
-                          "content_type": response_record["content_type"],
-                          "raw": payload,
-                      }
-                  except Exception as exc:
-                      last_error = repr(exc)
-                  finally:
-                      page.close()
-
-                  if attempt < 2:
-                      time.sleep(1.5 * (attempt + 1))
-
-              return {
-                  "domain": domain,
-                  "available": None,
-                  "has_error": True,
-                  "error_message": last_error,
-                  "http_status": None,
-                  "content_type": "",
-                  "raw": None,
-              }
-
-          with sync_playwright() as p:
-              executable = "/usr/bin/google-chrome"
-              browser = p.chromium.launch(
-                  executable_path=executable if os.path.exists(executable) else None,
-                  headless=True,
-                  args=["--no-sandbox"],
+          if by_name.get("auda.au", {}).get("available") is not False:
+              raise RuntimeError(f"Known-taken control failed: {by_name.get('auda.au')!r}")
+          if by_name.get("xqzvkjhgfdsapoiuytrewq.au", {}).get("available") is not True:
+              raise RuntimeError(
+                  f"Known-available control failed: {by_name.get('xqzvkjhgfdsapoiuytrewq.au')!r}"
               )
 
-              control_rows = []
-              for domain, expected in controls:
-                  row = check_one(browser, domain)
-                  control_rows.append(row)
-                  if row["available"] is not expected:
-                      raise RuntimeError(
-                          f"Control failed for {domain}: expected {expected}, got {row!r}"
-                      )
+          available = sorted(
+              domain for domain in domains
+              if by_name.get(domain, {}).get("available") is True
+          )
+          unavailable = sorted(
+              domain for domain in domains
+              if by_name.get(domain, {}).get("available") is False
+          )
 
-              rows = []
-              for index, domain in enumerate(candidates, start=1):
-                  row = check_one(browser, domain)
-                  rows.append(row)
-                  print(
-                      f"PROGRESS {index}/38 {domain} "
-                      f"available={row['available']} error={row['has_error']}",
-                      flush=True,
-                  )
-
-              browser.close()
-
-          errors = sorted(row["domain"] for row in rows if row["available"] is None)
-          available = sorted(row["domain"] for row in rows if row["available"] is True)
-          unavailable = sorted(row["domain"] for row in rows if row["available"] is False)
-
-          csv_path = Path("numeric-au-stack2-crosscheck.csv")
+          csv_path = Path("two-character-au-numeric-namecheap.csv")
           with csv_path.open("w", newline="", encoding="utf-8") as handle:
               writer = csv.DictWriter(
                   handle,
                   fieldnames=[
-                      "domain", "available", "has_error", "error_message",
-                      "http_status", "content_type",
+                      "domain", "available", "error", "registrar",
+                      "created_year", "extensions_taken",
                   ],
               )
               writer.writeheader()
-              for row in rows:
-                  writer.writerow({key: row[key] for key in writer.fieldnames})
+              for domain in domains:
+                  row = by_name.get(domain, {})
+                  extra_data = row.get("extra") or {}
+                  whois = row.get("whois") or {}
+                  writer.writerow({
+                      "domain": domain,
+                      "available": row.get("available"),
+                      "error": row.get("error", ""),
+                      "registrar": extra_data.get("registrar", ""),
+                      "created_year": extra_data.get("createdYear") or whois.get("createdYear", ""),
+                      "extensions_taken": extra_data.get("extensionsTaken", ""),
+                  })
 
-          raw_path = Path("numeric-au-stack2-crosscheck-raw.json")
+          raw_path = Path("two-character-au-numeric-namecheap-raw.json")
           raw_path.write_text(
-              json.dumps({"controls": control_rows, "results": rows}, indent=2, sort_keys=True) + "\n",
+              json.dumps(results, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
               encoding="utf-8",
           )
 
           summary = {
               "checked_at_utc": datetime.now(timezone.utc).isoformat(),
-              "checker": "Stack2 .au Domain Checker",
-              "method": "browser submission through the public checker form",
-              "first_pass_candidate_count": len(candidates),
-              "crosscheck_available_count": len(available),
-              "crosscheck_unavailable_count": len(unavailable),
-              "crosscheck_error_count": len(errors),
+              "method": "Namecheap availability backend via davejoelwilson/domain-checker",
+              "checker_commit": subprocess.run(
+                  ["git", "-C", "checker", "rev-parse", "HEAD"],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              ).stdout.strip(),
+              "numeric_domain_count": len(domains),
+              "available_count": len(available),
+              "unavailable_count": len(unavailable),
               "available": available,
-              "unavailable": unavailable,
+              "missing": missing,
+              "extra": extra,
+              "duplicates": sorted(set(duplicates)),
+              "malformed_count": len(malformed),
               "errors": errors,
-              "controls": control_rows,
+              "ambiguous": ambiguous,
+              "controls": {
+                  "auda.au": by_name.get("auda.au"),
+                  "xqzvkjhgfdsapoiuytrewq.au": by_name.get("xqzvkjhgfdsapoiuytrewq.au"),
+              },
               "csv_sha256": hashlib.sha256(csv_path.read_bytes()).hexdigest(),
               "raw_sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
           }
-          Path("numeric-au-stack2-crosscheck-summary.json").write_text(
+          Path("two-character-au-numeric-namecheap-summary.json").write_text(
               json.dumps(summary, indent=2, sort_keys=True) + "\n",
               encoding="utf-8",
           )
+          Path("two-character-au-numeric-namecheap-available.txt").write_text(
+              "\n".join(available) + ("\n" if available else ""),
+              encoding="utf-8",
+          )
 
-          print("BEGIN_STACK2_NUMERIC_AU_SUMMARY")
+          print("BEGIN_NUMERIC_AU_NAMECHEAP_SUMMARY")
           print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
-          print("END_STACK2_NUMERIC_AU_SUMMARY")
+          print("END_NUMERIC_AU_NAMECHEAP_SUMMARY")
 
-          if errors or len(available) + len(unavailable) != len(candidates):
-              raise SystemExit("Cross-check did not return a complete conclusive result set")
+          if missing or extra or duplicates or malformed or errors or ambiguous:
+              raise SystemExit("Registrar result set was incomplete or ambiguous")
+          if len(available) + len(unavailable) != len(domains):
+              raise SystemExit("Not all 620 names received a conclusive result")
 
-      - name: Upload exact cross-check results
+      - name: Upload exact results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: numeric-au-stack2-crosscheck-definitive
+          name: two-character-au-numeric-namecheap
           path: |
-            numeric-au-stack2-crosscheck-summary.json
-            numeric-au-stack2-crosscheck.csv
-            numeric-au-stack2-crosscheck-raw.json
+            two-character-au-numeric-namecheap-summary.json
+            two-character-au-numeric-namecheap.csv
+            two-character-au-numeric-namecheap-available.txt
+            two-character-au-numeric-namecheap-raw.json
           if-no-files-found: warn
           retention-days: 2
