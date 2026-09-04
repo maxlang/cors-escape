@@ -1,4 +1,4 @@
-name: Temporary numeric two-character .au Australian registrar cross-check
+name: Temporary numeric two-character .au corrected Australian registrar cross-check
 
 on:
   push:
@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
-      - name: Check controls and all 38 first-pass candidates
+      - name: Check controls and the exact 38 candidates from the first-pass artifact
         shell: python
         run: |
           import csv
@@ -29,12 +29,13 @@ jobs:
           landing_url = "https://www.ddns.com.au/domains/bulkregister"
           endpoint = "https://www.ddns.com.au/cart.php"
           candidates = """
-          09.au 0u.au 0x.au 16.au 1b.au 1j.au 1n.au 1p.au 1u.au 20.au
-          24.au 2a.au 2f.au 2t.au 2u.au 36.au 3q.au 42.au 4d.au 4z.au
-          54.au 5z.au 6d.au 6r.au 74.au 75.au 76.au 7l.au 8c.au 8t.au
-          92.au 9c.au 9m.au a4.au d5.au q1.au w5.au x0.au
+          09.au 0v.au 0z.au 1d.au 20.au 4f.au 4l.au 4r.au 4z.au 5a.au
+          5b.au 5l.au 5n.au 5u.au 6d.au 6l.au 6n.au 6v.au 6y.au 7i.au
+          7l.au 7n.au 7u.au 88.au 8f.au 9b.au 9j.au 9m.au 9w.au 9x.au
+          9y.au a4.au g0.au g7.au q4.au t4.au w3.au y7.au
           """.split()
           assert len(candidates) == 38 and len(set(candidates)) == 38
+          assert hashlib.sha256(("\n".join(candidates) + "\n").encode()).hexdigest() == "8893af31425e54817b29c9ce429656f77a3d37de5b672024455784e752b4e6b8"
 
           controls = [
               ("auda.au", False),
@@ -167,7 +168,7 @@ jobs:
               if row["available"] is False and row["registered"] is False
           )
 
-          csv_path = Path("numeric-au-ddns-crosscheck.csv")
+          csv_path = Path("numeric-au-ddns-corrected-crosscheck.csv")
           with csv_path.open("w", newline="", encoding="utf-8") as handle:
               writer = csv.DictWriter(
                   handle,
@@ -180,7 +181,7 @@ jobs:
               for row in rows:
                   writer.writerow({key: row[key] for key in writer.fieldnames})
 
-          raw_path = Path("numeric-au-ddns-crosscheck-raw.json")
+          raw_path = Path("numeric-au-ddns-corrected-crosscheck-raw.json")
           raw_path.write_text(
               json.dumps({"controls": control_rows, "results": rows}, indent=2, sort_keys=True) + "\n",
               encoding="utf-8",
@@ -190,6 +191,7 @@ jobs:
               "checked_at_utc": datetime.now(timezone.utc).isoformat(),
               "registrar": "Discount Domain Name Services (Australia)",
               "method": "public registrar checkDomain endpoint, serial requests",
+              "source_candidate_artifact_sha256": "cb875a96793f2b570ac1eb12f7782f5ecee5d192d7e3d55f109c2a659eb57f2a",
               "candidate_count": len(candidates),
               "available_count": len(available),
               "unavailable_count": len(unavailable),
@@ -207,26 +209,26 @@ jobs:
               "csv_sha256": hashlib.sha256(csv_path.read_bytes()).hexdigest(),
               "raw_sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
           }
-          Path("numeric-au-ddns-crosscheck-summary.json").write_text(
+          Path("numeric-au-ddns-corrected-crosscheck-summary.json").write_text(
               json.dumps(summary, indent=2, sort_keys=True) + "\n",
               encoding="utf-8",
           )
 
-          print("BEGIN_NUMERIC_AU_DDNS_SUMMARY")
+          print("BEGIN_NUMERIC_AU_DDNS_CORRECTED_SUMMARY")
           print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
-          print("END_NUMERIC_AU_DDNS_SUMMARY")
+          print("END_NUMERIC_AU_DDNS_CORRECTED_SUMMARY")
 
           if errors or invalid or len(available) + len(unavailable) != len(candidates):
               raise SystemExit("Australian registrar cross-check was incomplete or invalid")
 
-      - name: Upload exact cross-check results
+      - name: Upload exact corrected cross-check results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: numeric-au-ddns-crosscheck
+          name: numeric-au-ddns-corrected-crosscheck
           path: |
-            numeric-au-ddns-crosscheck-summary.json
-            numeric-au-ddns-crosscheck.csv
-            numeric-au-ddns-crosscheck-raw.json
+            numeric-au-ddns-corrected-crosscheck-summary.json
+            numeric-au-ddns-corrected-crosscheck.csv
+            numeric-au-ddns-corrected-crosscheck-raw.json
           if-no-files-found: warn
           retention-days: 2
