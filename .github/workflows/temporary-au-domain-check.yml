@@ -1,4 +1,4 @@
-name: Temporary numeric two-character .au cross-check
+name: Temporary numeric two-character .au browser cross-check
 
 on:
   push:
@@ -11,19 +11,24 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
-      - name: Cross-check all 38 first-pass candidates
+      - name: Install Playwright Python package
+        run: python -m pip install --quiet playwright
+
+      - name: Cross-check all 38 first-pass candidates through the public form
         shell: python
         run: |
           import csv
           import hashlib
           import json
+          import os
+          import re
           import time
           from datetime import datetime, timezone
           from pathlib import Path
 
-          import requests
+          from playwright.sync_api import sync_playwright
 
           page_url = "https://stack2.au/tools/domain-checker"
           candidates = """
@@ -32,57 +37,72 @@ jobs:
           54.au 5z.au 6d.au 6r.au 74.au 75.au 76.au 7l.au 8c.au 8t.au
           92.au 9c.au 9m.au a4.au d5.au q1.au w5.au x0.au
           """.split()
-          assert len(candidates) == 38
-          assert len(set(candidates)) == 38
+          assert len(candidates) == 38 and len(set(candidates)) == 38
 
           controls = {
               "auda.au": False,
               "xqzvkjhgfdsapoiuytrewq.au": True,
           }
 
-          session = requests.Session()
-          session.headers.update({
-              "Accept": "application/json, text/plain, */*",
-              "Origin": "https://stack2.au",
-              "Referer": page_url,
-              "User-Agent": "Mozilla/5.0 numeric-two-character-au-crosscheck/1.0",
-          })
-          landing = session.get(page_url, timeout=30)
-          landing.raise_for_status()
-
-          def query(domain):
+          def check_one(browser, domain):
               last_error = None
-              for attempt in range(4):
+              for attempt in range(3):
+                  page = browser.new_page(viewport={"width": 1280, "height": 900})
                   try:
-                      response = session.post(
-                          page_url,
-                          data={"domain": domain},
-                          timeout=45,
-                      )
-                      if response.status_code != 200:
-                          last_error = f"HTTP {response.status_code}: {response.text[:500]}"
-                      else:
-                          payload = response.json()
-                          if not isinstance(payload, dict):
-                              raise ValueError(f"unexpected payload type: {type(payload).__name__}")
-                          if payload.get("domain", "").lower().rstrip(".") != domain:
-                              raise ValueError(f"domain mismatch: {payload!r}")
-                          if payload.get("hasError") is True:
-                              raise RuntimeError(payload.get("errorMessage") or "checker reported an error")
-                          value = payload.get("isAvailable")
-                          if value not in (True, False):
-                              raise ValueError(f"missing boolean isAvailable: {payload!r}")
-                          return {
-                              "domain": domain,
-                              "available": bool(value),
-                              "has_error": bool(payload.get("hasError", False)),
-                              "error_message": payload.get("errorMessage", ""),
-                              "raw": payload,
-                          }
+                      page.goto(page_url, wait_until="networkidle", timeout=90000)
+
+                      fields = page.locator("input:visible")
+                      chosen = None
+                      for i in range(fields.count()):
+                          field = fields.nth(i)
+                          field_type = (field.get_attribute("type") or "text").lower()
+                          if field_type in {"text", "search"}:
+                              chosen = field
+                              break
+                      if chosen is None:
+                          raise RuntimeError("No visible text/search input found")
+                      chosen.fill(domain)
+
+                      buttons = page.get_by_role("button", name=re.compile(r"^Check$", re.I))
+                      if buttons.count() == 0:
+                          buttons = page.locator("button:visible")
+                      if buttons.count() == 0:
+                          raise RuntimeError("No visible Check button found")
+
+                      with page.expect_response(
+                          lambda response: response.url == page_url
+                          and response.request.method == "POST",
+                          timeout=90000,
+                      ) as response_info:
+                          buttons.first.click()
+                      response = response_info.value
+                      body = response.text()
+                      if response.status != 200:
+                          raise RuntimeError(f"HTTP {response.status}: {body[:500]}")
+                      payload = json.loads(body)
+                      if not isinstance(payload, dict):
+                          raise ValueError(f"unexpected payload: {payload!r}")
+                      reported = str(payload.get("domain", "")).lower().rstrip(".")
+                      if reported != domain:
+                          raise ValueError(f"domain mismatch: expected {domain}, got {reported}")
+                      if payload.get("hasError") is True:
+                          raise RuntimeError(payload.get("errorMessage") or "checker error")
+                      available = payload.get("isAvailable")
+                      if available not in (True, False):
+                          raise ValueError(f"missing boolean isAvailable: {payload!r}")
+                      return {
+                          "domain": domain,
+                          "available": bool(available),
+                          "has_error": False,
+                          "error_message": "",
+                          "raw": payload,
+                      }
                   except Exception as exc:
                       last_error = repr(exc)
-                  if attempt < 3:
-                      time.sleep(1.5 * (attempt + 1))
+                  finally:
+                      page.close()
+                  if attempt < 2:
+                      time.sleep(2 * (attempt + 1))
               return {
                   "domain": domain,
                   "available": None,
@@ -91,21 +111,25 @@ jobs:
                   "raw": None,
               }
 
-          control_rows = []
-          for domain, expected in controls.items():
-              row = query(domain)
-              control_rows.append(row)
-              if row["available"] is not expected:
-                  raise RuntimeError(
-                      f"Control failed for {domain}: expected {expected}, got {row!r}"
-                  )
-              time.sleep(1)
+          with sync_playwright() as p:
+              executable = "/usr/bin/google-chrome"
+              browser = p.chromium.launch(
+                  executable_path=executable if os.path.exists(executable) else None,
+                  headless=True,
+                  args=["--no-sandbox"],
+              )
 
-          rows = []
-          for index, domain in enumerate(candidates):
-              rows.append(query(domain))
-              if index + 1 < len(candidates):
-                  time.sleep(0.8)
+              control_rows = []
+              for domain, expected in controls.items():
+                  row = check_one(browser, domain)
+                  control_rows.append(row)
+                  if row["available"] is not expected:
+                      raise RuntimeError(
+                          f"Control failed for {domain}: expected {expected}, got {row!r}"
+                      )
+
+              rows = [check_one(browser, domain) for domain in candidates]
+              browser.close()
 
           errors = sorted(row["domain"] for row in rows if row["available"] is None)
           available = sorted(row["domain"] for row in rows if row["available"] is True)
@@ -130,7 +154,7 @@ jobs:
           summary = {
               "checked_at_utc": datetime.now(timezone.utc).isoformat(),
               "checker": "Stack2 .au Domain Checker",
-              "checker_url": page_url,
+              "method": "browser submission through the public checker form",
               "first_pass_candidate_count": len(candidates),
               "crosscheck_available_count": len(available),
               "crosscheck_unavailable_count": len(unavailable),
