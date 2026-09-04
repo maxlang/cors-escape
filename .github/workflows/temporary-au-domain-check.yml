@@ -1,4 +1,4 @@
-name: Temporary numeric two-character .au fast browser cross-check
+name: Temporary numeric two-character .au definitive cross-check
 
 on:
   push:
@@ -11,7 +11,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 12
     steps:
       - name: Install Playwright Python package
         run: python -m pip install --quiet playwright
@@ -30,7 +30,7 @@ jobs:
 
           from playwright.sync_api import sync_playwright
 
-          page_url = "https://stack2.au/tools/domain-checker"
+          checker_url = "https://stack2.au/tools/domain-checker"
           candidates = """
           09.au 0u.au 0x.au 16.au 1b.au 1j.au 1n.au 1p.au 1u.au 20.au
           24.au 2a.au 2f.au 2t.au 2u.au 36.au 3q.au 42.au 4d.au 4z.au
@@ -44,6 +44,103 @@ jobs:
               ("xqzvkjhgfdsapoiuytrewq.au", True),
           ]
 
+          def check_one(browser, domain):
+              last_error = None
+              for attempt in range(3):
+                  page = browser.new_page(viewport={"width": 1280, "height": 900})
+                  captured = []
+
+                  def on_response(response):
+                      request = response.request
+                      if request.method != "POST":
+                          return
+                      if response.url.rstrip("/") != checker_url.rstrip("/"):
+                          return
+                      try:
+                          text = response.text()
+                          payload = json.loads(text)
+                          reported = str(payload.get("domain", "")).lower().rstrip(".")
+                          if reported == domain:
+                              captured.append({
+                                  "http_status": response.status,
+                                  "content_type": response.headers.get("content-type", ""),
+                                  "payload": payload,
+                              })
+                      except Exception as exc:
+                          captured.append({"capture_error": repr(exc)})
+
+                  try:
+                      page.on("response", on_response)
+                      page.goto(checker_url, wait_until="networkidle", timeout=90000)
+
+                      fields = page.locator("input:visible")
+                      field = None
+                      for index in range(fields.count()):
+                          candidate = fields.nth(index)
+                          field_type = (candidate.get_attribute("type") or "text").lower()
+                          if field_type in {"text", "search"}:
+                              field = candidate
+                              break
+                      if field is None:
+                          raise RuntimeError("No visible text/search input found")
+
+                      buttons = page.get_by_role("button", name=re.compile(r"^Check$", re.I))
+                      if buttons.count() == 0:
+                          buttons = page.locator("button:visible")
+                      if buttons.count() == 0:
+                          raise RuntimeError("No visible Check button found")
+
+                      field.fill(domain)
+                      buttons.first.click()
+
+                      for _ in range(100):
+                          page.wait_for_timeout(200)
+                          if captured:
+                              break
+                      if not captured:
+                          raise TimeoutError("No matching checker response within 20 seconds")
+                      if captured[-1].get("capture_error"):
+                          raise RuntimeError(captured[-1]["capture_error"])
+
+                      response_record = captured[-1]
+                      payload = response_record["payload"]
+                      if response_record["http_status"] != 200:
+                          raise RuntimeError(
+                              f"HTTP {response_record['http_status']}: {payload!r}"
+                          )
+                      if payload.get("hasError") is True:
+                          raise RuntimeError(payload.get("errorMessage") or "checker error")
+                      available = payload.get("isAvailable")
+                      if available not in (True, False):
+                          raise ValueError(f"missing boolean isAvailable: {payload!r}")
+
+                      return {
+                          "domain": domain,
+                          "available": bool(available),
+                          "has_error": False,
+                          "error_message": "",
+                          "http_status": response_record["http_status"],
+                          "content_type": response_record["content_type"],
+                          "raw": payload,
+                      }
+                  except Exception as exc:
+                      last_error = repr(exc)
+                  finally:
+                      page.close()
+
+                  if attempt < 2:
+                      time.sleep(1.5 * (attempt + 1))
+
+              return {
+                  "domain": domain,
+                  "available": None,
+                  "has_error": True,
+                  "error_message": last_error,
+                  "http_status": None,
+                  "content_type": "",
+                  "raw": None,
+              }
+
           with sync_playwright() as p:
               executable = "/usr/bin/google-chrome"
               browser = p.chromium.launch(
@@ -51,85 +148,26 @@ jobs:
                   headless=True,
                   args=["--no-sandbox"],
               )
-              page = browser.new_page(viewport={"width": 1280, "height": 900})
-              page.goto(page_url, wait_until="networkidle", timeout=90000)
-
-              def controls_for_page():
-                  fields = page.locator("input:visible")
-                  field = None
-                  for i in range(fields.count()):
-                      candidate = fields.nth(i)
-                      field_type = (candidate.get_attribute("type") or "text").lower()
-                      if field_type in {"text", "search"}:
-                          field = candidate
-                          break
-                  if field is None:
-                      raise RuntimeError("No visible text/search input found")
-
-                  buttons = page.get_by_role("button", name=re.compile(r"^Check$", re.I))
-                  if buttons.count() == 0:
-                      buttons = page.locator("button:visible")
-                  if buttons.count() == 0:
-                      raise RuntimeError("No visible Check button found")
-                  return field, buttons.first
-
-              def query(domain):
-                  last_error = None
-                  for attempt in range(3):
-                      try:
-                          field, button = controls_for_page()
-                          field.fill(domain)
-                          button.wait_for(state="visible", timeout=30000)
-                          with page.expect_response(
-                              lambda response: response.url == page_url
-                              and response.request.method == "POST",
-                              timeout=90000,
-                          ) as response_info:
-                              button.click()
-                          response = response_info.value
-                          body = response.text()
-                          if response.status != 200:
-                              raise RuntimeError(f"HTTP {response.status}: {body[:500]}")
-                          payload = json.loads(body)
-                          reported = str(payload.get("domain", "")).lower().rstrip(".")
-                          if reported != domain:
-                              raise ValueError(f"domain mismatch: expected {domain}, got {reported}")
-                          if payload.get("hasError") is True:
-                              raise RuntimeError(payload.get("errorMessage") or "checker error")
-                          available = payload.get("isAvailable")
-                          if available not in (True, False):
-                              raise ValueError(f"missing boolean isAvailable: {payload!r}")
-                          page.wait_for_timeout(200)
-                          return {
-                              "domain": domain,
-                              "available": bool(available),
-                              "has_error": False,
-                              "error_message": "",
-                              "raw": payload,
-                          }
-                      except Exception as exc:
-                          last_error = repr(exc)
-                          page.reload(wait_until="networkidle", timeout=90000)
-                          if attempt < 2:
-                              time.sleep(attempt + 1)
-                  return {
-                      "domain": domain,
-                      "available": None,
-                      "has_error": True,
-                      "error_message": last_error,
-                      "raw": None,
-                  }
 
               control_rows = []
               for domain, expected in controls:
-                  row = query(domain)
+                  row = check_one(browser, domain)
                   control_rows.append(row)
                   if row["available"] is not expected:
                       raise RuntimeError(
                           f"Control failed for {domain}: expected {expected}, got {row!r}"
                       )
 
-              rows = [query(domain) for domain in candidates]
+              rows = []
+              for index, domain in enumerate(candidates, start=1):
+                  row = check_one(browser, domain)
+                  rows.append(row)
+                  print(
+                      f"PROGRESS {index}/38 {domain} "
+                      f"available={row['available']} error={row['has_error']}",
+                      flush=True,
+                  )
+
               browser.close()
 
           errors = sorted(row["domain"] for row in rows if row["available"] is None)
@@ -140,7 +178,10 @@ jobs:
           with csv_path.open("w", newline="", encoding="utf-8") as handle:
               writer = csv.DictWriter(
                   handle,
-                  fieldnames=["domain", "available", "has_error", "error_message"],
+                  fieldnames=[
+                      "domain", "available", "has_error", "error_message",
+                      "http_status", "content_type",
+                  ],
               )
               writer.writeheader()
               for row in rows:
@@ -183,7 +224,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: numeric-au-stack2-crosscheck-fast
+          name: numeric-au-stack2-crosscheck-definitive
           path: |
             numeric-au-stack2-crosscheck-summary.json
             numeric-au-stack2-crosscheck.csv
