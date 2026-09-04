@@ -1,4 +1,4 @@
-name: Temporary auDA availability-service probe
+name: Temporary numeric two-character .au auDA verification
 
 on:
   push:
@@ -9,48 +9,156 @@ permissions:
   contents: read
 
 jobs:
-  probe:
+  check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
-      - name: Query known controls and disputed short names
+      - name: Query auDA's dedicated availability service
         shell: python
         run: |
+          import csv
+          import hashlib
           import json
           import socket
           import time
+          from datetime import datetime, timezone
+          from pathlib import Path
 
           host = "domaincheck.auda.org.au"
-          domains = [
-              "auda.au",
-              "xqzvkjhgfdsapoiuytrewq.au",
-              "4f.au",
-              "4z.au",
-              "6d.au",
-              "7l.au",
-          ]
-          results = []
+          candidates = """
+          09.au 0v.au 0z.au 1d.au 20.au 4f.au 4l.au 4r.au 4z.au 5a.au
+          5b.au 5l.au 5n.au 5u.au 6d.au 6l.au 6n.au 6v.au 6y.au 7i.au
+          7l.au 7n.au 7u.au 88.au 8f.au 9b.au 9j.au 9m.au 9w.au 9x.au
+          9y.au a4.au g0.au g7.au q4.au t4.au w3.au y7.au
+          """.split()
+          assert len(candidates) == 38 and len(set(candidates)) == 38
+          assert hashlib.sha256(("\n".join(candidates) + "\n").encode()).hexdigest() == "8f3307d3cb763abd751fd336b30d96db0bfca45105aded6631c688d48f0dadaf"
 
-          for domain in domains:
-              try:
-                  with socket.create_connection((host, 43), timeout=20) as sock:
-                      sock.settimeout(20)
-                      sock.sendall((domain + "\r\n").encode("ascii"))
-                      chunks = []
-                      while True:
-                          try:
-                              chunk = sock.recv(65536)
-                          except socket.timeout:
-                              break
-                          if not chunk:
-                              break
-                          chunks.append(chunk)
-                  text = b"".join(chunks).decode("utf-8", "replace")
-                  results.append({"domain": domain, "response": text})
-              except Exception as exc:
-                  results.append({"domain": domain, "error": repr(exc)})
-              time.sleep(1.5)
+          controls = {
+              "auda.au": "Not Available",
+              "xqzvkjhgfdsapoiuytrewq.au": "Available",
+          }
 
-          print("BEGIN_AUDA_DOMAINCHECK_PROBE")
-          print(json.dumps(results, ensure_ascii=False))
-          print("END_AUDA_DOMAINCHECK_PROBE")
+          def query(domain):
+              last_error = None
+              for attempt in range(4):
+                  try:
+                      with socket.create_connection((host, 43), timeout=20) as sock:
+                          sock.settimeout(20)
+                          sock.sendall((domain + "\r\n").encode("ascii"))
+                          chunks = []
+                          while True:
+                              try:
+                                  chunk = sock.recv(65536)
+                              except socket.timeout:
+                                  break
+                              if not chunk:
+                                  break
+                              chunks.append(chunk)
+                      response = b"".join(chunks).decode("utf-8", "replace").strip()
+                      if response not in {"Available", "Not Available"}:
+                          raise ValueError(f"Unexpected response {response!r}")
+                      return {
+                          "domain": domain,
+                          "response": response,
+                          "available": response == "Available",
+                          "error": "",
+                      }
+                  except Exception as exc:
+                      last_error = repr(exc)
+                      if attempt < 3:
+                          time.sleep(2 * (attempt + 1))
+              return {
+                  "domain": domain,
+                  "response": "",
+                  "available": None,
+                  "error": last_error,
+              }
+
+          control_rows = []
+          for domain, expected in controls.items():
+              row = query(domain)
+              control_rows.append(row)
+              if row["response"] != expected:
+                  raise RuntimeError(
+                      f"Control failed for {domain}: expected {expected!r}, got {row!r}"
+                  )
+              time.sleep(1.25)
+
+          rows = []
+          for index, domain in enumerate(candidates, start=1):
+              row = query(domain)
+              rows.append(row)
+              print(
+                  f"PROGRESS {index}/38 {domain} response={row['response']!r} "
+                  f"error={bool(row['error'])}",
+                  flush=True,
+              )
+              if index < len(candidates):
+                  time.sleep(1.25)
+
+          available = sorted(row["domain"] for row in rows if row["available"] is True)
+          unavailable = sorted(row["domain"] for row in rows if row["available"] is False)
+          errors = sorted(row["domain"] for row in rows if row["available"] is None)
+
+          csv_path = Path("numeric-au-auda-verification.csv")
+          with csv_path.open("w", newline="", encoding="utf-8") as handle:
+              writer = csv.DictWriter(
+                  handle,
+                  fieldnames=["domain", "response", "available", "error"],
+              )
+              writer.writeheader()
+              writer.writerows(rows)
+
+          Path("numeric-au-auda-available.txt").write_text(
+              "\n".join(available) + ("\n" if available else ""),
+              encoding="utf-8",
+          )
+
+          raw_path = Path("numeric-au-auda-verification-raw.json")
+          raw_path.write_text(
+              json.dumps({"controls": control_rows, "results": rows}, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          summary = {
+              "checked_at_utc": datetime.now(timezone.utc).isoformat(),
+              "service": host,
+              "method": "auDA dedicated domain-name availability service on TCP port 43",
+              "source_candidate_artifact_sha256": "cb875a96793f2b570ac1eb12f7782f5ecee5d192d7e3d55f109c2a659eb57f2a",
+              "candidate_list_sha256": "8f3307d3cb763abd751fd336b30d96db0bfca45105aded6631c688d48f0dadaf",
+              "candidate_count": len(candidates),
+              "available_count": len(available),
+              "unavailable_count": len(unavailable),
+              "error_count": len(errors),
+              "available": available,
+              "unavailable": unavailable,
+              "errors": errors,
+              "controls": control_rows,
+              "csv_sha256": hashlib.sha256(csv_path.read_bytes()).hexdigest(),
+              "raw_sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
+          }
+          Path("numeric-au-auda-verification-summary.json").write_text(
+              json.dumps(summary, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          print("BEGIN_NUMERIC_AU_AUDA_SUMMARY")
+          print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
+          print("END_NUMERIC_AU_AUDA_SUMMARY")
+
+          if errors or len(available) + len(unavailable) != len(candidates):
+              raise SystemExit("auDA result set was incomplete or ambiguous")
+
+      - name: Upload exact auDA verification results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: numeric-au-auda-verification
+          path: |
+            numeric-au-auda-verification-summary.json
+            numeric-au-auda-verification.csv
+            numeric-au-auda-available.txt
+            numeric-au-auda-verification-raw.json
+          if-no-files-found: warn
+          retention-days: 2
