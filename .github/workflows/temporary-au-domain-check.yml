@@ -35,7 +35,7 @@ jobs:
           9y.au a4.au g0.au g7.au q4.au t4.au w3.au y7.au
           """.split()
           assert len(candidates) == 38 and len(set(candidates)) == 38
-          assert hashlib.sha256(("\n".join(candidates) + "\n").encode()).hexdigest() == "8893af31425e54817b29c9ce429656f77a3d37de5b672024455784e752b4e6b8"
+          assert hashlib.sha256(("\n".join(candidates) + "\n").encode()).hexdigest() == "8f3307d3cb763abd751fd336b30d96db0bfca45105aded6631c688d48f0dadaf"
 
           controls = [
               ("auda.au", False),
@@ -192,6 +192,7 @@ jobs:
               "registrar": "Discount Domain Name Services (Australia)",
               "method": "public registrar checkDomain endpoint, serial requests",
               "source_candidate_artifact_sha256": "cb875a96793f2b570ac1eb12f7782f5ecee5d192d7e3d55f109c2a659eb57f2a",
+              "candidate_list_sha256": "8f3307d3cb763abd751fd336b30d96db0bfca45105aded6631c688d48f0dadaf",
               "candidate_count": len(candidates),
               "available_count": len(available),
               "unavailable_count": len(unavailable),
