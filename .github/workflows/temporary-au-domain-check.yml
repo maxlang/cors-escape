@@ -1,4 +1,4 @@
-name: Temporary two-letter .au candidate check
+name: Temporary numeric .au bulk-check trace
 
 on:
   push:
@@ -9,38 +9,30 @@ permissions:
   contents: read
 
 jobs:
-  check:
+  trace:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 8
     steps:
-      - name: Install browser driver
-        shell: bash
+      - name: Install Playwright Python package
         run: python -m pip install --quiet playwright
 
-      - name: Check every DNS-absent or inconclusive two-letter candidate
+      - name: Trace Naked Whois sample lookup
         shell: python
         run: |
-          import hashlib
           import json
           import os
-          import time
-          from datetime import datetime, timezone
-          from pathlib import Path
+          import re
           from playwright.sync_api import sync_playwright
 
-          # Authoritative .au parent-zone sweep at 2026-09-03T18:22Z found
-          # 205 names as NXDOMAIN. ds.au and ho.au were transiently inconclusive,
-          # so they are included too. The remaining 469 two-letter combinations
-          # returned conclusive NOERROR/delegation responses and are unavailable.
-          candidate_text = """
-          aa.au ab.au ac.au ad.au af.au ag.au ai.au am.au an.au aq.au as.au at.au au.au aw.au bb.au be.au bj.au bl.au bn.au bp.au bt.au ca.au cb.au cc.au cg.au ch.au cj.au cl.au co.au cp.au cs.au ct.au cu.au cv.au cx.au db.au dh.au di.au dk.au dm.au do.au dp.au ds.au du.au ea.au ed.au eg.au eh.au em.au eo.au eq.au er.au et.au eu.au ff.au fi.au fn.au fo.au fq.au fv.au ga.au gg.au gh.au gj.au go.au gt.au gu.au gv.au ha.au hc.au hd.au hh.au hi.au hm.au hn.au ho.au hw.au hx.au ia.au ib.au ic.au if.au im.au iq.au iw.au jc.au jk.au jn.au jp.au kc.au kg.au kl.au km.au ko.au kp.au kr.au ks.au kz.au ld.au lh.au lj.au ll.au lv.au mb.au mc.au md.au mh.au ml.au mp.au mr.au ms.au mt.au mv.au my.au na.au nb.au ne.au nf.au nl.au np.au ns.au nw.au nx.au oc.au og.au oj.au ok.au om.au or.au ou.au ov.au ox.au pa.au pc.au pg.au pi.au pk.au pm.au po.au ps.au qa.au qb.au qc.au qd.au ql.au qm.au qo.au rc.au re.au rf.au rh.au rk.au ro.au rp.au rr.au rw.au rx.au sf.au sg.au sj.au sl.au sn.au st.au su.au sw.au ta.au tg.au tm.au tn.au tp.au tr.au ts.au tv.au uc.au ul.au us.au uz.au va.au vc.au vi.au vn.au vu.au vx.au we.au wg.au wq.au wu.au wv.au xb.au xc.au xi.au xv.au yc.au yq.au yv.au yy.au za.au zb.au zf.au zg.au zi.au zl.au zn.au zp.au zv.au zx.au zy.au
-          """
-          candidates = candidate_text.split()
-          assert len(candidates) == 207, len(candidates)
-          assert len(set(candidates)) == 207
-
-          controls = ["auda.au", "xqzvkjhgfdsapoiuytrewq.au"]
-          all_results = {}
+          controls = [
+              "auda.au",
+              "xqzvkjhgfdsapoiuytrewq.au",
+              "00.au",
+              "a0.au",
+              "0a.au",
+              "99.au",
+          ]
+          events = []
 
           with sync_playwright() as p:
               executable = "/usr/bin/google-chrome"
@@ -49,144 +41,72 @@ jobs:
                   headless=True,
                   args=["--no-sandbox"],
               )
-              page = browser.new_page(viewport={"width": 1280, "height": 900})
-              page.goto("https://www.ddns.com.au/domains/bulkregister", wait_until="networkidle", timeout=90000)
-              token = page.locator("input[name=token]").first.input_value()
-              if not token:
-                  raise RuntimeError("Registrar form did not provide a session token")
+              page = browser.new_page(viewport={"width": 1440, "height": 1200})
 
-              def query_batch(domains):
-                  payload = page.evaluate(
-                      """
-                      async ({domains, token}) => {
-                        return await Promise.all(domains.map(async (domain) => {
-                          const body = new URLSearchParams({
-                            a: 'checkDomain', domain, type: 'domain', token
-                          });
-                          try {
-                            const response = await fetch('/cart.php', {
-                              method: 'POST',
-                              headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'},
-                              body: body.toString(),
-                              credentials: 'same-origin'
-                            });
-                            return {domain, http_status: response.status, text: await response.text()};
-                          } catch (error) {
-                            return {domain, fetch_error: String(error)};
-                          }
-                        }));
+              def on_request(request):
+                  if request.resource_type in {"xhr", "fetch"}:
+                      events.append({
+                          "kind": "request",
+                          "resource_type": request.resource_type,
+                          "method": request.method,
+                          "url": request.url,
+                          "post_data": request.post_data,
+                      })
+
+              def on_response(response):
+                  request = response.request
+                  if request.resource_type in {"xhr", "fetch"}:
+                      item = {
+                          "kind": "response",
+                          "resource_type": request.resource_type,
+                          "method": request.method,
+                          "url": response.url,
+                          "status": response.status,
+                          "content_type": response.headers.get("content-type", ""),
                       }
-                      """,
-                      {"domains": domains, "token": token},
-                  )
-                  parsed = []
-                  for item in payload:
-                      domain = item["domain"]
-                      if item.get("fetch_error"):
-                          parsed.append({"domain": domain, "error": item["fetch_error"]})
-                          continue
-                      if item.get("http_status") != 200:
-                          parsed.append({"domain": domain, "error": f"HTTP {item.get('http_status')}", "body": item.get("text", "")[:500]})
-                          continue
                       try:
-                          body = json.loads(item["text"])
-                          rows = body.get("result")
-                          if not isinstance(rows, list) or len(rows) != 1:
-                              raise ValueError(f"unexpected result count: {rows!r}")
-                          row = rows[0]
-                          parsed.append({
-                              "domain": domain,
-                              "reported_domain": row.get("domainName"),
-                              "status": row.get("status"),
-                              "legacy_status": row.get("legacyStatus"),
-                              "is_available": row.get("isAvailable"),
-                              "is_registered": row.get("isRegistered"),
-                              "is_valid_domain": row.get("isValidDomain"),
-                              "domain_error_message": row.get("domainErrorMessage"),
-                              "is_premium": row.get("isPremium"),
-                              "shortest_period": row.get("shortestPeriod"),
-                          })
+                          item["body"] = response.text()[:30000]
                       except Exception as exc:
-                          parsed.append({"domain": domain, "error": repr(exc), "body": item.get("text", "")[:1000]})
-                  return parsed
+                          item["body_error"] = repr(exc)
+                      events.append(item)
 
-              control_rows = query_batch(controls)
-              control_map = {row["domain"]: row for row in control_rows}
-              if control_map.get("auda.au", {}).get("is_registered") is not True:
-                  raise RuntimeError(f"Taken control failed: {control_rows!r}")
-              if control_map.get("xqzvkjhgfdsapoiuytrewq.au", {}).get("is_available") is not True:
-                  raise RuntimeError(f"Available control failed: {control_rows!r}")
+              page.on("request", on_request)
+              page.on("response", on_response)
+              page.goto("https://nakedwhois.com/", wait_until="networkidle", timeout=90000)
 
-              for start in range(0, len(candidates), 20):
-                  batch = candidates[start:start + 20]
-                  rows = query_batch(batch)
-                  for row in rows:
-                      domain = row["domain"]
-                      if domain in all_results:
-                          raise RuntimeError(f"Duplicate result for {domain}")
-                      all_results[domain] = row
-                  if start + 20 < len(candidates):
-                      time.sleep(1.5)
+              fields = page.locator("textarea:visible")
+              if fields.count() == 0:
+                  raise RuntimeError("No visible textarea found")
+              fields.first.fill("\n".join(controls))
 
+              buttons = page.get_by_role("button", name=re.compile(r"Check Availability", re.I))
+              if buttons.count() == 0:
+                  buttons = page.locator("button:visible")
+              buttons.first.click()
+
+              page.wait_for_timeout(15000)
+              body = page.locator("body").inner_text()
+              rows = page.locator("table tbody tr")
+              row_texts = [rows.nth(i).inner_text() for i in range(rows.count())]
+
+              print("BEGIN_NAKEDWHOIS_TRACE")
+              print(json.dumps({
+                  "controls": controls,
+                  "url": page.url,
+                  "row_count": rows.count(),
+                  "rows": row_texts,
+                  "events": events,
+                  "body_text": body[:50000],
+              }, ensure_ascii=False))
+              print("END_NAKEDWHOIS_TRACE")
+              page.screenshot(path="nakedwhois-sample.png", full_page=True)
               browser.close()
 
-          missing = sorted(set(candidates) - set(all_results))
-          extra = sorted(set(all_results) - set(candidates))
-          errors = sorted(domain for domain, row in all_results.items() if row.get("error"))
-          invalid = sorted(domain for domain, row in all_results.items() if row.get("is_valid_domain") is not True)
-          mismatched = sorted(domain for domain, row in all_results.items() if row.get("reported_domain") != domain)
-          available = sorted(domain for domain, row in all_results.items() if row.get("is_available") is True)
-          registered = sorted(domain for domain, row in all_results.items() if row.get("is_registered") is True)
-          other_unavailable = sorted(
-              domain for domain, row in all_results.items()
-              if not row.get("error")
-              and row.get("is_valid_domain") is True
-              and row.get("is_available") is not True
-              and row.get("is_registered") is not True
-          )
-
-          ordered_rows = [all_results[d] for d in candidates if d in all_results]
-          raw_path = Path("two-letter-au-ddns-candidate-results.json")
-          raw_path.write_text(json.dumps(ordered_rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-          summary = {
-              "checked_at_utc": datetime.now(timezone.utc).isoformat(),
-              "registrar": "Discount Domain Name Services (ddns.com.au)",
-              "method": "public registrar checkDomain request, submitted in batches of at most 20",
-              "authoritative_dns_prefilter_checked": 676,
-              "authoritative_dns_conclusive_unavailable": 469,
-              "registrar_candidates_checked": len(candidates),
-              "available_count": len(available),
-              "registered_count_among_candidates": len(registered),
-              "other_unavailable_count": len(other_unavailable),
-              "available": available,
-              "registered_among_candidates": registered,
-              "other_unavailable": other_unavailable,
-              "errors": errors,
-              "invalid": invalid,
-              "mismatched": mismatched,
-              "missing": missing,
-              "extra": extra,
-              "controls": control_rows,
-              "raw_sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
-          }
-          Path("two-letter-au-ddns-summary.json").write_text(
-              json.dumps(summary, indent=2, sort_keys=True) + "\n",
-              encoding="utf-8",
-          )
-          print("BEGIN_TWO_LETTER_AU_DDNS_SUMMARY")
-          print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
-          print("END_TWO_LETTER_AU_DDNS_SUMMARY")
-
-          if missing or extra or errors or invalid or mismatched:
-              raise SystemExit("Registrar candidate sweep was not complete and valid")
-
-      - name: Upload exact registrar results
+      - name: Upload screenshot
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: two-letter-au-ddns-results
-          path: |
-            two-letter-au-ddns-summary.json
-            two-letter-au-ddns-candidate-results.json
+          name: nakedwhois-sample
+          path: nakedwhois-sample.png
           if-no-files-found: warn
           retention-days: 1
