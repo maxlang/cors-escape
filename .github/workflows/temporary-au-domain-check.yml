@@ -1,4 +1,4 @@
-name: Temporary numeric two-character .au sweep
+name: Temporary Stack2 .au availability trace
 
 on:
   push:
@@ -9,156 +9,105 @@ permissions:
   contents: read
 
 jobs:
-  check:
+  trace:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 10
     steps:
-      - name: Check the 620 additional alphanumeric names
+      - name: Install Playwright Python package
+        run: python -m pip install --quiet playwright
+
+      - name: Trace independent checks
         shell: python
         run: |
-          import csv
-          import hashlib
           import json
-          import string
-          import time
-          from datetime import datetime, timezone
-          from pathlib import Path
+          import os
+          import re
+          from playwright.sync_api import sync_playwright
 
-          import requests
-
-          endpoint = "https://nakedwhois.com/api/check"
-          alphabet = string.ascii_lowercase + string.digits
           domains = [
-              f"{a}{b}.au"
-              for a in alphabet
-              for b in alphabet
-              if a.isdigit() or b.isdigit()
+              "auda.au",
+              "xqzvkjhgfdsapoiuytrewq.au",
+              "09.au",
+              "00.au",
+              "a4.au",
+              "4z.au",
           ]
-          assert len(domains) == 620
-          assert len(set(domains)) == 620
+          output = []
 
-          session = requests.Session()
-          session.headers.update({
-              "Accept": "text/event-stream",
-              "Content-Type": "application/json",
-              "Origin": "https://nakedwhois.com",
-              "Referer": "https://nakedwhois.com/",
-              "User-Agent": "Mozilla/5.0 numeric-two-character-au-audit/1.0",
-          })
+          with sync_playwright() as p:
+              executable = "/usr/bin/google-chrome"
+              browser = p.chromium.launch(
+                  executable_path=executable if os.path.exists(executable) else None,
+                  headless=True,
+                  args=["--no-sandbox"],
+              )
 
-          def check_batch(batch):
-              last_error = None
-              for attempt in range(4):
-                  try:
-                      response = session.post(
-                          endpoint,
-                          json={"domains": batch},
-                          timeout=(30, 240),
-                      )
-                      if response.status_code == 200:
-                          rows = []
-                          for line in response.text.splitlines():
-                              line = line.strip()
-                              if not line or not line.startswith("data:"):
-                                  continue
-                              payload = json.loads(line[5:].strip())
-                              rows.append(payload)
-                          return rows, response.text
-                      last_error = f"HTTP {response.status_code}: {response.text[:500]}"
-                  except Exception as exc:
-                      last_error = repr(exc)
-                  if attempt < 3:
-                      time.sleep(2 ** attempt)
-              raise RuntimeError(last_error)
+              for domain in domains:
+                  events = []
+                  page = browser.new_page(viewport={"width": 1440, "height": 1000})
 
-          all_rows = []
-          raw_parts = []
-          for start in range(0, len(domains), 500):
-              batch = domains[start:start + 500]
-              rows, raw = check_batch(batch)
-              all_rows.extend(rows)
-              raw_parts.append(raw)
-              if start + 500 < len(domains):
-                  time.sleep(2)
+                  def on_request(request):
+                      if request.resource_type in {"xhr", "fetch", "document"}:
+                          events.append({
+                              "kind": "request",
+                              "resource_type": request.resource_type,
+                              "method": request.method,
+                              "url": request.url,
+                              "post_data": request.post_data,
+                          })
 
-          by_domain = {}
-          duplicates = []
-          malformed = []
-          for row in all_rows:
-              domain = str(row.get("domain", "")).lower().rstrip(".")
-              if not domain or row.get("available") not in (True, False):
-                  malformed.append(row)
-                  continue
-              if domain in by_domain:
-                  duplicates.append(domain)
-              by_domain[domain] = {
-                  "domain": domain,
-                  "available": bool(row["available"]),
-                  "premium": row.get("premium"),
-                  "price": row.get("price"),
-                  "error": row.get("error"),
-              }
+                  def on_response(response):
+                      request = response.request
+                      if request.resource_type in {"xhr", "fetch", "document"}:
+                          item = {
+                              "kind": "response",
+                              "resource_type": request.resource_type,
+                              "method": request.method,
+                              "url": response.url,
+                              "status": response.status,
+                              "content_type": response.headers.get("content-type", ""),
+                          }
+                          try:
+                              if request.resource_type in {"xhr", "fetch"}:
+                                  item["body"] = response.text()[:20000]
+                          except Exception as exc:
+                              item["body_error"] = repr(exc)
+                          events.append(item)
 
-          expected = set(domains)
-          returned = set(by_domain)
-          missing = sorted(expected - returned)
-          extra = sorted(returned - expected)
-          available = sorted(d for d, row in by_domain.items() if row["available"])
-          taken = sorted(d for d, row in by_domain.items() if not row["available"])
+                  page.on("request", on_request)
+                  page.on("response", on_response)
+                  page.goto("https://stack2.au/tools/domain-checker", wait_until="networkidle", timeout=90000)
 
-          ordered = [by_domain[d] for d in domains if d in by_domain]
-          csv_path = Path("two-character-au-with-numbers.csv")
-          with csv_path.open("w", newline="", encoding="utf-8") as handle:
-              writer = csv.DictWriter(handle, fieldnames=["domain", "available", "premium", "price", "error"])
-              writer.writeheader()
-              writer.writerows(ordered)
+                  fields = page.locator("input:visible")
+                  chosen = None
+                  for i in range(fields.count()):
+                      field = fields.nth(i)
+                      try:
+                          if field.get_attribute("type") in (None, "text", "search"):
+                              chosen = field
+                              break
+                      except Exception:
+                          pass
+                  if chosen is None:
+                      raise RuntimeError("No visible text/search input found")
+                  chosen.fill(domain)
 
-          Path("two-character-au-with-numbers-available.txt").write_text(
-              "\n".join(available) + ("\n" if available else ""),
-              encoding="utf-8",
-          )
-          raw_path = Path("two-character-au-with-numbers-raw.sse")
-          raw_path.write_text("\n\n".join(raw_parts), encoding="utf-8")
+                  buttons = page.get_by_role("button", name=re.compile(r"^Check$", re.I))
+                  if buttons.count() == 0:
+                      buttons = page.locator("button:visible")
+                  buttons.first.click()
+                  page.wait_for_timeout(7000)
 
-          summary = {
-              "checked_at_utc": datetime.now(timezone.utc).isoformat(),
-              "scope": "two-character direct .au domains containing at least one digit",
-              "characters": "a-z and 0-9",
-              "endpoint": endpoint,
-              "expected_count": len(domains),
-              "returned_count": len(all_rows),
-              "unique_valid_count": len(by_domain),
-              "available_count": len(available),
-              "taken_count": len(taken),
-              "available": available,
-              "missing": missing,
-              "extra": extra,
-              "duplicates": sorted(set(duplicates)),
-              "malformed": malformed,
-              "csv_sha256": hashlib.sha256(csv_path.read_bytes()).hexdigest(),
-              "raw_sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
-          }
-          Path("two-character-au-with-numbers-summary.json").write_text(
-              json.dumps(summary, indent=2, sort_keys=True) + "\n",
-              encoding="utf-8",
-          )
+                  output.append({
+                      "domain": domain,
+                      "url": page.url,
+                      "body_text": page.locator("body").inner_text()[:30000],
+                      "events": events,
+                  })
+                  page.close()
 
-          print("BEGIN_NUMERIC_AU_SUMMARY")
-          print(json.dumps(summary, sort_keys=True, separators=(",", ":")))
-          print("END_NUMERIC_AU_SUMMARY")
+              browser.close()
 
-          if missing or extra or duplicates or malformed or len(by_domain) != 620:
-              raise SystemExit("Bulk checker did not return a complete, unambiguous 620-name result set")
-
-      - name: Upload exact results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: two-character-au-with-numbers
-          path: |
-            two-character-au-with-numbers-summary.json
-            two-character-au-with-numbers.csv
-            two-character-au-with-numbers-available.txt
-            two-character-au-with-numbers-raw.sse
-          if-no-files-found: warn
-          retention-days: 2
+          print("BEGIN_STACK2_TRACE")
+          print(json.dumps(output, ensure_ascii=False))
+          print("END_STACK2_TRACE")
